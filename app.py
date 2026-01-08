@@ -9,12 +9,12 @@ import io
 # --- КОНФІГУРАЦІЯ СТОРІНКИ ---
 st.set_page_config(page_title="Autonomous Class Monitor’s Logbook", layout="wide")
 
-# Ініціалізація кукі
+# Ініціалізація контролера кукі
 if 'controller' not in st.session_state:
     st.session_state.controller = CookieController()
 controller = st.session_state.controller
 
-# Список групи
+# Список вашої групи
 MY_GROUP = [
     "Адамлюк Владислав Романович", "Бичко Дар'я Юріївна", "Бугрова Юлія Вікторівна", 
     "Бурейко Володимир Омелянович", "Гончарук Ангеліна Сергіївна", "Гріщенко Світлана Василівна", 
@@ -88,9 +88,9 @@ def init_db():
     c.execute('CREATE TABLE IF NOT EXISTS users(username TEXT PRIMARY KEY, password TEXT, full_name TEXT)')
     c.execute('''CREATE TABLE IF NOT EXISTS attendance
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, student_name TEXT, date TEXT, 
-                  period TEXT, subject TEXT, status TEXT, moderator TEXT, semester TEXT)''')
+                  period TEXT, subject TEXT, status TEXT, moderator TEXT)''')
     
-    # Перевірка наявності колонки semester (якщо база стара)
+    # ПЕРЕВІРКА ТА ОНОВЛЕННЯ СТРУКТУРИ (щоб не було помилок як на відео)
     try:
         c.execute("SELECT semester FROM attendance LIMIT 1")
     except sqlite3.OperationalError:
@@ -119,9 +119,34 @@ init_db()
 conn = create_connection()
 
 if not st.session_state["authenticated"]:
-    # Код сторінки входу (login_register_page) аналогічно попереднім версіям
     st.title("🎓 Logbook Access")
-    # ... (код входу тут)
+    tab1, tab2 = st.tabs(["🔑 Увійти", "📝 Реєстрація"])
+    c = conn.cursor()
+
+    with tab1:
+        saved_user = controller.get('remember_user')
+        user = st.text_input("Логін", value=saved_user if saved_user else "", key="l_user")
+        pwd = st.text_input("Пароль", type='password', key="l_pwd")
+        if st.button("Увійти", use_container_width=True):
+            c.execute('SELECT * FROM users WHERE username=?', (user,))
+            data = c.fetchone()
+            if data and check_hashes(pwd, data[1]):
+                perform_login(data)
+            else:
+                st.error("Невірний логін або пароль")
+
+    with tab2:
+        new_user = st.text_input("Придумайте логін", key="r_user")
+        new_full_name = st.text_input("Ваше ПІБ", key="r_name")
+        new_pwd = st.text_input("Придумайте пароль", type='password', key="r_pwd")
+        if st.button("Зареєструватися", use_container_width=True):
+            if new_user and new_pwd and new_full_name:
+                try:
+                    c.execute('INSERT INTO users VALUES (?,?,?)', (new_user, make_hashes(new_pwd), new_full_name))
+                    conn.commit()
+                    st.success("Аккаунт створено! Увійдіть.")
+                except:
+                    st.error("Цей логін вже зайнятий")
     st.stop()
 
 # МЕНЮ
@@ -142,7 +167,6 @@ if menu == "Нова перекличка":
         
         absent_status = {}
         c1, c2 = st.columns(2)
-        # Сортуємо список групи перед виведенням чекбоксів
         sorted_group = sorted(MY_GROUP)
         for i, student in enumerate(sorted_group):
             target_col = c1 if i % 2 == 0 else c2
@@ -159,42 +183,64 @@ if menu == "Нова перекличка":
                           (s, d_str, period, subject, status, st.session_state['username'], current_sem))
             conn.commit()
             st.success("Успішно збережено!")
+            st.balloons()
 
 elif menu == "Архів та Експорт":
     st.subheader(f"📂 Архів записів ({current_sem})")
-    # Додаємо ORDER BY student_name ASC для алфавітного порядку
-    query = f"""SELECT student_name, date, period, subject, status, moderator 
+    query = f"""SELECT id, student_name, date, period, subject, status, moderator, semester 
                 FROM attendance 
                 WHERE semester='{current_sem}' 
                 ORDER BY date DESC, period DESC, student_name ASC"""
     df = pd.read_sql(query, conn)
     
     if not df.empty:
-        # Відображення таблиці
         st.dataframe(df, use_container_width=True)
-        
-        # Експорт (також буде відсортований завдяки SQL запиту)
         csv = df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 Завантажити CSV (від А до Я)", csv, f"attendance_{current_sem}.csv", "text/csv", use_container_width=True)
+        st.download_button("📥 Завантажити CSV", csv, f"attendance_{current_sem}.csv", "text/csv", use_container_width=True)
     else:
         st.info("Дані відсутні.")
 
+elif menu == "Імпорт":
+    st.subheader("📥 Імпорт зовнішніх даних")
+    st.info("Формат файлу повинен містити колонки: student_name, date, period, subject, status, moderator, semester")
+    
+    uploaded_file = st.file_uploader("Оберіть файл для імпорту (CSV або Excel)", type=['csv', 'xlsx'])
+    
+    if uploaded_file is not None:
+        try:
+            # Зчитування файлу
+            if uploaded_file.name.endswith('.csv'):
+                imp_df = pd.read_csv(uploaded_file)
+            else:
+                imp_df = pd.read_excel(uploaded_file)
+            
+            st.write("Попередній перегляд даних:")
+            st.dataframe(imp_df.head())
+            
+            if st.button("🚀 Підтвердити імпорт у базу"):
+                imp_df.to_sql('attendance', conn, if_exists='append', index=False)
+                st.success("Дані успішно імпортовано!")
+                st.rerun()
+        except Exception as e:
+            st.error(f"Помилка при імпорті: {e}")
+
 elif menu == "Статистика":
     st.subheader("📊 Рейтинг прогулів (від А до Я)")
-    # Сортування результатів статистики
     query = f"""SELECT student_name, COUNT(*) as absences 
                 FROM attendance 
                 WHERE status='н' AND semester='{current_sem}' 
                 GROUP BY student_name 
                 ORDER BY student_name ASC"""
-    df_s = pd.read_sql(query, conn)
-    
-    if not df_s.empty:
-        st.bar_chart(df_s.set_index('student_name'))
-        st.table(df_s)
-    else:
-        st.success("Прогулів не знайдено!")
+    try:
+        df_s = pd.read_sql(query, conn)
+        if not df_s.empty:
+            st.bar_chart(df_s.set_index('student_name'))
+            st.table(df_s)
+        else:
+            st.success("Прогулів не знайдено!")
+    except Exception:
+        st.info("Статистика поки недоступна.")
 
-if st.sidebar.button("Logout 🚪"):
+if st.sidebar.button("Вийти 🚪"):
     st.session_state["authenticated"] = False
     st.rerun()
